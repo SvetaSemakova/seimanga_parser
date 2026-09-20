@@ -40,16 +40,11 @@ DB_CONFIG = {
 }
 
 
-# ---------------------------------------------------------------------------
-# 1. Работа с базой данных
-# ---------------------------------------------------------------------------
-
 def get_connection():
     return mysql.connector.connect(**DB_CONFIG)
 
 
 def init_db():
-    """Создаёт основную и связанные таблицы, сохраняя совместимость со старой схемой."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -68,18 +63,13 @@ def init_db():
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci
         """
     )
-    # Если таблица была создана старой версией с genres VARCHAR(500),
-    # автоматически переводим поле в TEXT. Это устраняет ошибку 1406.
+
     try:
         cur.execute("ALTER TABLE manga MODIFY COLUMN genres TEXT NULL")
     except Error as e:
         log.warning("Не удалось обновить поле genres: %s", e)
 
-    # Новые поля: ромадзи/японское название, локальный путь к обложке
-    # и количество найденных глав. Персонажи хранятся отдельно.
-    # ADD COLUMN оборачиваем в try/except, т.к. старые MySQL (<8.0.29)
-    # не поддерживают "ADD COLUMN IF NOT EXISTS" — ошибка 1060
-    # (Duplicate column name) означает, что колонка уже есть, это нормально.
+
     new_columns = {
         "romaji": "VARCHAR(500) NULL",
         "japanese_name": "VARCHAR(500) NULL",
@@ -143,7 +133,6 @@ def init_db():
 
 
 def save_manga(item: dict) -> int | None:
-    """Сохраняет мангу и возвращает её id для связанных таблиц."""
     conn = get_connection()
     cur = conn.cursor()
     sql = """
@@ -170,7 +159,6 @@ def save_manga(item: dict) -> int | None:
             chapters_count = COALESCE(VALUES(chapters_count), chapters_count)
     """
     try:
-        # Защита от слишком длинных значений даже в старой/неожиданной схеме.
         limits = {
             "title": 500, "cover_url": 1000, "cover_path": 500,
             "author": 255, "status": 100, "year": 10, "rate": 10,
@@ -182,7 +170,6 @@ def save_manga(item: dict) -> int | None:
 
         params = dict(item)
         params.pop("characters", None)
-        # Гарантируем, что в SQL уйдут все нужные ключи, даже если их не было в item.
         for key in ("cover_path", "romaji", "japanese_name", "rate", "year", "chapters_count"):
             params.setdefault(key, None)
 
@@ -202,7 +189,6 @@ def save_manga(item: dict) -> int | None:
 
 
 def save_characters(manga_id: int | None, characters: list[dict]) -> None:
-    """Сохраняет персонажей отдельно и связывает их с мангой."""
     if not manga_id:
         return
     conn = get_connection()
@@ -229,7 +215,6 @@ def save_characters(manga_id: int | None, characters: list[dict]) -> None:
 
 
 def save_chapter_pages(manga_id: int | None, chapter: dict, pages: list[dict]) -> None:
-    """Сохраняет главу и её страницы с внешними ключами."""
     if not manga_id:
         return
     conn = get_connection()
@@ -269,16 +254,11 @@ def save_chapter_pages(manga_id: int | None, chapter: dict, pages: list[dict]) -
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# 2. Загрузка страницы
-# ---------------------------------------------------------------------------
-
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update(HEADERS)
 
 
 def fetch(url: str) -> BeautifulSoup | None:
-    """Загружает HTML через общую сессию, чтобы сохранять cookies сайта."""
     try:
         resp = HTTP_SESSION.get(url, timeout=15)
         resp.raise_for_status()
@@ -291,10 +271,6 @@ def fetch(url: str) -> BeautifulSoup | None:
 
 
 def make_empty_item(source: str, url: str) -> dict:
-    """Создаёт нормализованную запись манги из прямого URL.
-
-    В режиме urls.txt поиск по названию и sitemap не используется.
-    """
     return {
         "source": source,
         "url": url,
@@ -314,32 +290,12 @@ def make_empty_item(source: str, url: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 3. Общий парсер для движка Grouple (seimanga, zazaza/readmanga, mintmanga
-#    и другие сайты этой сети имеют одинаковую вёрстку страницы тайтла)
-# ---------------------------------------------------------------------------
-
-# Диапазоны юникода для японской азбуки (хирагана/катакана) и кандзи —
-# используем, чтобы отличить японское название от ромадзи/английского
-# среди альтернативных названий.
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
 
 MAX_CHARACTERS = 6
 
 
 def parse_grouple_detail(item: dict):
-    """
-    Заходим на страницу конкретной манги и заполняем поля.
-    Селекторы основаны на реальной структуре страницы Grouple-движка
-    (проверено на странице seimanga.me/spokoinoi_nochi__punpun).
-    Если у конкретного сайта верстка немного отличается — часть полей
-    может не найтись, тогда просто останется None, остальное соберётся.
-
-    cover_url/characters[].image_url тут — ещё ССЫЛКИ, а не локальные файлы:
-    сами картинки скачивает вызывающий код (после того как известно
-    итоговое название манги — оно нужно для имени папки), через
-    download_cover() / download_characters().
-    """
     soup = fetch(item["url"])
     if not soup:
         return item
@@ -375,10 +331,6 @@ def parse_grouple_detail(item: dict):
     item["description"] = descr_tag.get_text(strip=True) if descr_tag else None
 
     # --- Ромадзи и японское название ---
-    # Ищем по уникальному тексту тултипа, а не по классу-обёртке (он неизвестен
-    # из присланного фрагмента), внутри — несколько <span>, разделённых
-    # <span class="cr-hero-names__alt-separator">/</span>. Японское название
-    # определяем по наличию иероглифов/каны, остальное считаем ромадзи.
     alt_names_tag = soup.find("span", attrs={"data-tippy-content": re.compile("показать весь список", re.I)})
     romaji_parts, japanese_parts = [], []
     if alt_names_tag:
@@ -411,11 +363,6 @@ def parse_grouple_detail(item: dict):
 
 
 def parse_characters(soup: BeautifulSoup, manga_url: str, limit: int = MAX_CHARACTERS) -> list[dict]:
-    """Достаёт первых `limit` персонажей манги: имя + ссылка на картинку.
-
-    Картинки тут ещё не скачаны (это делает download_characters() позже,
-    когда известно итоговое название манги для имени папки).
-    """
     characters = []
     seen_names = set()
     for a in soup.select("a[href*='/list/person/']"):
@@ -436,11 +383,6 @@ def parse_characters(soup: BeautifulSoup, manga_url: str, limit: int = MAX_CHARA
     return characters
 
 
-
-# ---------------------------------------------------------------------------
-# 4. Парсер глав и страниц главы
-# ---------------------------------------------------------------------------
-
 CHAPTERS_DIR = Path("chapters")
 COVERS_DIR = Path("covers")
 CHARACTERS_DIR = Path("characters")
@@ -453,7 +395,6 @@ def _clean_url(url: str, base_url: str) -> str:
 
 
 def _chapter_number(text: str, url: str = "") -> float:
-    """Извлекает номер главы для сортировки. Например 12.5 -> 12.5."""
     value = f"{text} {url}".lower().replace(",", ".")
     patterns = [
         r"(?:глава|chapter|chap|том|тома|volume)\s*[-№#:]?\s*(\d+(?:\.\d+)?)",
@@ -496,7 +437,6 @@ _TRANSLITERATION = str.maketrans({
 
 
 def _safe_name(text: str) -> str:
-    """Возвращает безопасное имя пути только из латиницы, цифр и `_`/`.`/`-`."""
     transliterated = (text or "").translate(_TRANSLITERATION)
     transliterated = unicodedata.normalize("NFKD", transliterated)
     transliterated = transliterated.encode("ascii", "ignore").decode("ascii")
@@ -505,13 +445,11 @@ def _safe_name(text: str) -> str:
 
 
 def parse_chapter_links(manga_url: str) -> list[dict]:
-    """Находит именно ссылки из списка глав, а не любые числовые ссылки страницы."""
     soup = fetch(manga_url)
     if not soup:
         return []
 
     found = {}
-    # Сначала ищем контейнер, в котором находится заголовок «Читать главы».
     heading = None
     for tag in soup.find_all(re.compile(r"^h[1-6]$")):
         text = tag.get_text(" ", strip=True).lower()
@@ -526,7 +464,6 @@ def parse_chapter_links(manga_url: str) -> list[dict]:
             if parent:
                 containers.append(parent)
                 parent = parent.parent
-    # Дополнительные известные контейнеры Grouple.
     for selector in (".manga-chapters", ".chapters", ".chapter-list", ".table-list", ".subject-chapters"):
         containers.extend(soup.select(selector))
 
@@ -534,7 +471,6 @@ def parse_chapter_links(manga_url: str) -> list[dict]:
     for container in containers:
         candidates.extend(container.select("a[href]"))
 
-    # Если контейнер не определился, берём ссылки, URL которых имеют структуру /volN/N.
     if not candidates:
         candidates = [a for a in soup.select("a[href]")
                       if re.search(r"/vol\d+(?:[./_-]|/|$)", a.get("href", ""), re.I)]
@@ -546,12 +482,10 @@ def parse_chapter_links(manga_url: str) -> list[dict]:
         url = _clean_url(href, manga_url)
         parsed = urlparse(url)
         path = parsed.path.rstrip("/")
-        # Для Grouple-сайтов глава имеет /vol<том>/<глава>.
         m = re.search(r"/vol(\d+(?:[.\-]\d+)?)/(\d+(?:[.\-]\d+)?)$", path, re.I)
         if not m:
             continue
         text = " ".join(a.stripped_strings).strip()
-        # Текст вида «1 - 1 Нана Комацу» — сохраняем целиком.
         volume = m.group(1).replace("-", ".")
         chapter_no = m.group(2).replace("-", ".")
         num = float(chapter_no)
@@ -569,29 +503,6 @@ def parse_chapter_links(manga_url: str) -> list[dict]:
 
 
 def _make_chrome_driver():
-    """Создаёт webdriver.Chrome с возможностью ручной настройки путей.
-
-    Если Selenium Manager не может сам скачать/найти chromedriver или Chrome
-    (частая ситуация в РФ — сервисы Google для автозагрузки chromedriver
-    могут быть недоступны/медленные, из-за чего падает с 'Service Unavailable'),
-    можно один раз скачать нужные файлы руками и указать пути через
-    переменные окружения, не трогая код:
-
-        CHROMEDRIVER_PATH=C:\\tools\\chromedriver.exe
-        CHROME_BINARY_PATH=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe
-
-    (в PowerShell: $env:CHROMEDRIVER_PATH="C:\\tools\\chromedriver.exe")
-
-    ВАЖНО про 'Service Unavailable': если в системе настроен HTTP(S)-прокси
-    (переменные HTTP_PROXY/HTTPS_PROXY/ALL_PROXY или системный прокси Windows),
-    Python-клиент Selenium заворачивает через него ДАЖЕ ЛОКАЛЬНОЕ соединение
-    Python -> chromedriver (127.0.0.1:порт). Прокси не умеет его обработать
-    и отвечает заглушкой 'Service Unavailable' вместо ответа chromedriver.
-    Поэтому ниже принудительно исключаем localhost/127.0.0.1 из прокси —
-    это не влияет на то, как сам браузер Chrome выходит в интернет
-    (у него собственные сетевые настройки), только на служебный канал
-    Python <-> chromedriver.
-    """
     for var in ("NO_PROXY", "no_proxy"):
         existing = os.environ.get(var, "")
         parts = [p for p in existing.split(",") if p.strip()]
@@ -621,7 +532,6 @@ def _make_chrome_driver():
 
 
 def _current_manga_img_src(driver, chapter_url: str) -> str | None:
-    """Достаёт URL текущей отображаемой страницы из img.manga-img."""
     src = driver.execute_script(
         """
         var img = document.querySelector('img.manga-img');
@@ -636,8 +546,6 @@ def _current_manga_img_src(driver, chapter_url: str) -> str | None:
 
 
 def _click_next_page(driver):
-    """Кликает по правой части изображения — так в этом ридере пролистывается
-    следующая страница (левая часть обычно листает назад)."""
     driver.execute_script(
         """
         var img = document.querySelector('img.manga-img');
@@ -657,16 +565,6 @@ def _click_next_page(driver):
 
 
 def _selenium_chapter_images(chapter_url: str) -> list[str]:
-    """Постранично пролистывает главу и собирает все img.manga-img.
-
-    Это не бесконечный скролл — ридер показывает ОДНУ страницу за раз,
-    и клик по правой части картинки переключает на следующую (клиентский JS
-    подменяет содержимое img.manga-img). Поэтому вместо скролла эмулируем
-    клик по правой части изображения и после каждого клика ждём, пока
-    src у img.manga-img изменится, пока не наберём предполагаемое число
-    страниц/пока src не перестанет меняться (конец главы) — с защитой от
-    случайного перехода на следующую главу и от зацикливания.
-    """
     if not SELENIUM_AVAILABLE:
         return []
     driver = None
@@ -697,8 +595,6 @@ def _selenium_chapter_images(chapter_url: str) -> list[str]:
             else:
                 stagnant += 1
 
-            # Ушли на другую главу (обычно клик по последней странице
-            # уводит на следующую главу) — эти картинки сюда не относятся.
             new_path = urlparse(driver.current_url).path.rstrip("/")
             if new_path != chapter_path:
                 if src and result and result[-1] == src:
@@ -707,7 +603,6 @@ def _selenium_chapter_images(chapter_url: str) -> list[str]:
                 break
 
             if stagnant >= 3:
-                # Несколько кликов подряд без новой страницы — похоже, это конец главы.
                 break
 
             _click_next_page(driver)
@@ -717,7 +612,7 @@ def _selenium_chapter_images(chapter_url: str) -> list[str]:
                     or urlparse(d.current_url).path.rstrip("/") != chapter_path
                 )
             except Exception:
-                pass  # клик мог не сработать - следующая итерация попробует снова
+                pass  
 
         log.info("Ридер (постраничный клик): найдено страниц: %s", len(result))
         for n, u in enumerate(result[:10], 1):
@@ -726,16 +621,8 @@ def _selenium_chapter_images(chapter_url: str) -> list[str]:
             log.info("  ... ещё %s страниц", len(result) - 10)
         return result
     except Exception as e:
-        # exc_info=True печатает полный traceback selenium, а не обрезанный
-        # str(e) — по нему обычно видна настоящая причина (не найден chrome,
-        # не скачался chromedriver, антивирус заблокировал процесс и т.д.).
         log.warning("Не удалось получить img.manga-img через браузер: %s", e, exc_info=True)
         log.warning(
-            "Если ошибка похожа на 'Service Unavailable' или Selenium не может "
-            "сам найти/скачать chromedriver: скачайте Chrome (обычную десктопную "
-            "версию, не из Microsoft Store) и подходящий chromedriver.exe вручную, "
-            "затем укажите пути через переменные окружения CHROME_BINARY_PATH и "
-            "CHROMEDRIVER_PATH (см. docstring _make_chrome_driver)."
         )
         return []
     finally:
@@ -743,7 +630,6 @@ def _selenium_chapter_images(chapter_url: str) -> list[str]:
             driver.quit()
 
 def _with_query_param(url: str, key: str, value: str) -> str:
-    """Добавляет/заменяет query-параметр, сохраняя остальные параметры."""
     parts = urlsplit(url)
     params = parse_qsl(parts.query, keep_blank_values=True)
     params = [(k, v) for k, v in params if k.lower() != key.lower()]
@@ -757,7 +643,6 @@ def _is_grouple_reader_url(url: str) -> bool:
 
 
 def _looks_like_age_gate(soup: BeautifulSoup | None) -> bool:
-    """Распознаёт страницу-предупреждение 18+ без привязки к одному классу."""
     if not soup:
         return False
     text = soup.get_text(" ", strip=True).lower()
@@ -773,16 +658,6 @@ def _looks_like_age_gate(soup: BeautifulSoup | None) -> bool:
 
 
 def parse_chapter_images(chapter_url: str) -> tuple[list[str], str]:
-    """Получает страницы ридера и возвращает (urls, effective_page_url).
-
-    Для ZazaZa/SeiManga у тайтлов 18+ исходная страница главы может показывать
-    только предупреждение. При нажатии «продолжить» сайт переводит на тот же
-    URL с ``?mtr=true``. Поэтому после пустого HTML автоматически пробуем этот
-    вариант в той же HTTP-сессии, сохраняя cookies.
-
-    Ищем исключительно ``img.manga-img`` — никакие другие картинки страницы
-    не рассматриваются.
-    """
     candidate_urls = [chapter_url]
     mtr_url = _with_query_param(chapter_url, "mtr", "true")
     if _is_grouple_reader_url(chapter_url) and mtr_url != chapter_url:
@@ -802,7 +677,6 @@ def parse_chapter_images(chapter_url: str) -> tuple[list[str], str]:
         seen = set()
         imgs = soup.select("img.manga-img")
         for img in imgs:
-            # В реальной разметке URL страницы находится в src.
             url = (
                 img.get("src")
                 or img.get("currentSrc")
@@ -831,7 +705,6 @@ def parse_chapter_images(chapter_url: str) -> tuple[list[str], str]:
         if _looks_like_age_gate(soup) and access_url == chapter_url:
             log.info("На странице обнаружено возрастное предупреждение; следующий запрос будет с ?mtr=true")
 
-    # Selenium оставляем только как последний fallback для обычных динамических ридеров.
     if SELENIUM_AVAILABLE:
         if last_url != chapter_url:
             log.info("Статический HTML с mtr=true пуст, пробую браузер: %s", last_url)
@@ -857,7 +730,6 @@ def _extension_from_url(url: str, content_type: str = "") -> str:
 
 
 def download_image(url: str, destination: Path, referer: str) -> bool:
-    """Скачивает страницу, но не сохраняет HTML/404 как картинку."""
     if destination.exists() and destination.stat().st_size > 0:
         return True
     headers = dict(HEADERS)
@@ -894,11 +766,6 @@ def download_image(url: str, destination: Path, referer: str) -> bool:
 
 
 def download_cover(cover_url: str | None, manga_title: str, referer: str) -> str | None:
-    """Скачивает обложку локально в covers/<манга>/cover.<ext> и возвращает
-    относительный путь к файлу (или None, если скачать не удалось/нет ссылки).
-
-    По требованию: обложка хранится в БД как локальный путь, а не как ссылка.
-    """
     if not cover_url:
         return None
     ext = _extension_from_url(cover_url)
@@ -909,11 +776,6 @@ def download_cover(cover_url: str | None, manga_title: str, referer: str) -> str
 
 
 def download_characters(characters: list[dict], manga_title: str, referer: str) -> list[dict]:
-    """Скачивает картинки персонажей в characters/<манга>/<имя>.<ext>.
-
-    Возвращает список с исходной ссылкой и локальным путём изображения для
-    последующего сохранения в таблицу characters.
-    """
     folder = CHARACTERS_DIR / _safe_name(manga_title)
     result = []
     for char in characters:
@@ -930,7 +792,6 @@ def download_characters(characters: list[dict], manga_title: str, referer: str) 
 
 def download_chapter(chapter: dict, manga_title: str, index: int,
                      manga_id: int | None = None) -> int:
-    """Сохраняет все страницы одной главы и manifest.json."""
     number = _chapter_number(chapter["title"], chapter["url"])
     number_part = f"{number:g}" if number != float("inf") else str(index)
     folder_name = f"chapter_{index:03d}_{_chapter_key(chapter['title'], chapter['url'])}"
@@ -968,11 +829,7 @@ def download_chapter(chapter: dict, manga_title: str, index: int,
 
 def parse_first_chapters(manga_url: str, manga_title: str, chapters_count: int = 1,
                          manga_id: int | None = None) -> tuple[int, int]:
-    """Парсит первые chapters_count глав выбранной манги.
 
-    Возвращает (сколько_страниц_скачано, сколько_всего_глав_найдено) —
-    второе число используется, чтобы сохранить в БД реальное число глав.
-    """
     chapters = parse_chapter_links(manga_url)
     if not chapters:
         log.warning("Главы не найдены: %s", manga_url)
@@ -987,19 +844,9 @@ def parse_first_chapters(manga_url: str, manga_title: str, chapters_count: int =
         time.sleep(0.7)
     return total, len(chapters)
 
-
-# ---------------------------------------------------------------------------
-# 5. Основной цикл
-# ---------------------------------------------------------------------------
-
 def load_urls_from_file(path: str) -> list[tuple[str, str]]:
     """Читает urls.txt. Можно указывать просто URL или source;URL.
 
-    Примеры:
-        https://1.seimanga.me/spokoinoi_nochi__punpun
-        https://zazaza.me/manga/example
-        seimanga;https://1.seimanga.me/spokoinoi_nochi__punpun
-    """
     pairs = []
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -1035,7 +882,6 @@ def load_urls_from_file(path: str) -> list[tuple[str, str]]:
     return pairs
 
 def run(urls_file: str = "urls.txt", chapters_count: int = 1):
-    """Главный режим: берёт прямые URL из urls.txt и скачивает первые N глав."""
     init_db()
 
     pairs = load_urls_from_file(urls_file)
@@ -1053,7 +899,6 @@ def run(urls_file: str = "urls.txt", chapters_count: int = 1):
         if not item.get("title"):
             log.warning("Название не найдено, использую имя из URL: %s", actual_title)
 
-        # Обложка и персонажи скачиваются локально (не хранятся как ссылки).
         item["cover_path"] = download_cover(item.get("cover_url"), actual_title, url)
         item["characters"] = download_characters(item.get("characters") or [], actual_title, url)
 
@@ -1068,7 +913,5 @@ def run(urls_file: str = "urls.txt", chapters_count: int = 1):
 
 
 if __name__ == "__main__":
-    # Единственный основной режим: ссылки берутся из urls.txt.
-    # Только первая глава каждой манги скачивается локально в папку chapters/.
     run("urls.txt", chapters_count=1)
-    # Например, для первых 10 глав: run("urls.txt", chapters_count=10)
+
