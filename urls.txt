@@ -1,0 +1,6 @@
+# Можно указывать просто URL — сайт определяется автоматически.
+# По одной ссылке на строку.
+#
+# Пример:
+# https://a.zazaza.me/klinok__rassekaiuchii_demonov__A5327
+https://1.seimanga.me/brodiaga
