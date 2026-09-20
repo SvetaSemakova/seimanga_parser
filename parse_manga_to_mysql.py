@@ -18,7 +18,7 @@ import json
 import os
 import unicodedata
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode, unquote
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -449,13 +449,6 @@ def parse_characters(soup: BeautifulSoup, manga_url: str, limit: int = MAX_CHARA
     return characters
 
 
-# Отдельные функции больше не нужны — parse_grouple_detail подходит
-# для обоих сайтов, но оставляем эти имена как алиасы, чтобы остальной
-# код скрипта (написанный раньше) продолжал работать без изменений.
-parse_seimanga_detail = parse_grouple_detail
-parse_zazaza_detail = parse_grouple_detail
-
-
 
 # ---------------------------------------------------------------------------
 # 4. Парсер глав и страниц главы
@@ -586,34 +579,6 @@ def parse_chapter_links(manga_url: str) -> list[dict]:
     chapters = list(found.values())
     chapters.sort(key=lambda x: (x["chapter_number"], float(x["volume"]), x["url"]))
     return chapters
-
-
-def _image_url(img, page_url: str) -> str | None:
-    attrs = (
-        "data-src", "data-original", "data-lazy-src", "data-url",
-        "data-image", "data-lazy", "src", "data-cfsrc"
-    )
-    for attr in attrs:
-        value = img.get(attr)
-        if value and not value.startswith("data:image/"):
-            return _clean_url(value, page_url)
-    srcset = img.get("srcset") or img.get("data-srcset")
-    if srcset:
-        # Берём последний/самый большой вариант.
-        value = srcset.split(",")[-1].strip().split(" ")[0]
-        if value:
-            return _clean_url(value, page_url)
-    return None
-
-
-def _chapter_image_candidate(img, chapter_url: str) -> str | None:
-    """Берёт только реальный src/currentSrc страницы ридера."""
-    attrs = ("currentSrc", "src", "data-src", "data-original", "data-lazy-src", "data-image")
-    for attr in attrs:
-        value = img.get(attr) if hasattr(img, "get") else None
-        if value and not value.startswith("data:image/"):
-            return _clean_url(value, chapter_url)
-    return None
 
 
 def _make_chrome_driver():
@@ -1036,32 +1001,6 @@ def parse_first_chapters(manga_url: str, manga_title: str, chapters_count: int =
     return total, len(chapters)
 
 
-def run_selected_manga(seimanga_titles_file: str = "titles_seimanga.txt",
-                       zazaza_titles_file: str = "titles_zazaza.txt",
-                       chapters_count: int = 1):
-    """Находит выбранные тайтлы и скачивает первые N глав каждого."""
-    init_db()
-    for source, file_name, finder in (
-        ("seimanga", seimanga_titles_file, search_seimanga),
-        ("zazaza", zazaza_titles_file, search_zazaza),
-    ):
-        for title in load_titles_from_file(file_name):
-            log.info("[%s] Ищу: %s", source, title)
-            url = finder(title)
-            if not url:
-                continue
-            item = make_empty_item(source, url)
-            item = parse_grouple_detail(item)
-            actual_title = item.get("title") or title
-            item["cover_path"] = download_cover(item.get("cover_url"), actual_title, url)
-            item["characters"] = download_characters(item.get("characters") or [], actual_title, url)
-            manga_id = save_manga(item)
-            save_characters(manga_id, item.get("characters") or [])
-            _, total_chapters = parse_first_chapters(url, actual_title, chapters_count, manga_id)
-            item["chapters_count"] = total_chapters
-            save_manga(item)
-            time.sleep(1.5)
-
 # ---------------------------------------------------------------------------
 # 5. Основной цикл
 # ---------------------------------------------------------------------------
@@ -1107,60 +1046,6 @@ def load_urls_from_file(path: str) -> list[tuple[str, str]]:
     except FileNotFoundError:
         log.error("Файл со ссылками не найден: %s", path)
     return pairs
-
-def load_titles_from_file(path: str) -> list[str]:
-    """Читает файл, где каждая строка — одно название тайтла для поиска."""
-    titles = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if line and not line.startswith("#"):
-                    titles.append(line)
-    except FileNotFoundError:
-        log.error("Файл с названиями не найден: %s", path)
-    return titles
-
-
-def run_by_titles(seimanga_titles_file: str = "titles_seimanga.txt",
-                   zazaza_titles_file: str = "titles_zazaza.txt"):
-    """
-    Режим, где вы указываете только НАЗВАНИЯ тайтлов (по одному на строку
-    в текстовом файле), а скрипт сам находит и парсит нужные страницы —
-    вообще без ручного сбора ссылок.
-    """
-    init_db()
-
-    for title in load_titles_from_file(seimanga_titles_file):
-        log.info("Ищу на seimanga: %s", title)
-        url = search_seimanga(title)
-        if not url:
-            continue
-        item = make_empty_item("seimanga", url)
-        item = parse_seimanga_detail(item)
-        actual_title = item.get("title") or title
-        item["cover_path"] = download_cover(item.get("cover_url"), actual_title, url)
-        item["characters"] = download_characters(item.get("characters") or [], actual_title, url)
-        manga_id = save_manga(item)
-        save_characters(manga_id, item.get("characters") or [])
-        time.sleep(1.5)
-
-    for title in load_titles_from_file(zazaza_titles_file):
-        log.info("Ищу на zazaza: %s", title)
-        url = search_zazaza(title)
-        if not url:
-            continue
-        item = make_empty_item("zazaza", url)
-        item = parse_zazaza_detail(item)
-        actual_title = item.get("title") or title
-        item["cover_path"] = download_cover(item.get("cover_url"), actual_title, url)
-        item["characters"] = download_characters(item.get("characters") or [], actual_title, url)
-        manga_id = save_manga(item)
-        save_characters(manga_id, item.get("characters") or [])
-        time.sleep(1.5)
-
-    log.info("Готово.")
-
 
 def run(urls_file: str = "urls.txt", chapters_count: int = 1):
     """Главный режим: берёт прямые URL из urls.txt и скачивает первые N глав."""
